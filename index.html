@@ -74,6 +74,12 @@
     </form>
   </dialog>
 
+  <dialog id="calendarDetailDialog">
+    <div class="modal-head"><h2>未対応事項の詳細</h2><button id="closeCalendarDetail" class="secondary mini">×</button></div>
+    <div id="calendarDetailBody" class="modal"></div>
+    <div class="modal-actions"><button id="editCalendarIssue" class="primary">編集する</button><button id="doneCalendarDetail" class="secondary">閉じる</button></div>
+  </dialog>
+
   <dialog id="projectDialog">
     <div class="modal-head"><h2>工事を管理</h2><button id="closeProjects" class="secondary mini">×</button></div>
     <div class="modal">
@@ -97,7 +103,7 @@
     const today=function(){return new Date().toISOString().slice(0,10);};
     const dateLabel=function(v){return v?new Date(v+'T00:00:00').toLocaleDateString('ja-JP',{month:'numeric',day:'numeric'}):'';};
     const rangeLabel=function(start,end){return dateLabel(start)+'～'+dateLabel(end);};
-    let currentUser=null,projects=[],activeProjectId='',issues=[],calendarIssues=[],calendarCursor=new Date(new Date().getFullYear(),new Date().getMonth(),1),editingIssue=null,newBeforePhotoFile=null,newAfterPhotoFile=null,existingBeforePhotoPath='',existingAfterPhotoPath='';
+    let currentUser=null,projects=[],activeProjectId='',issues=[],calendarIssues=[],calendarCursor=new Date(new Date().getFullYear(),new Date().getMonth(),1),editingIssue=null,calendarDetailIssue=null,newBeforePhotoFile=null,newAfterPhotoFile=null,existingBeforePhotoPath='',existingAfterPhotoPath='',realtimeChannel=null,reloadTimer=null;
 
     function notice(text,isError){$('appNotice').textContent=text||'';$('appNotice').style.color=isError?'#b91c1c':'#075985';}
     function authNotice(text,isError){$('authNotice').textContent=text||'';$('authNotice').style.color=isError?'#b91c1c':'#075985';}
@@ -127,6 +133,17 @@
       if(!projects.some(function(p){return p.id===activeProjectId;}))activeProjectId=projects[0].id;
       renderProjects();await Promise.all([loadIssues(),loadCalendarIssues()]);
     }
+    function scheduleSharedReload(){
+      clearTimeout(reloadTimer);
+      reloadTimer=setTimeout(function(){loadProjects();},350);
+    }
+    function startSharedSync(){
+      if(realtimeChannel)return;
+      realtimeChannel=client.channel('issue-management-shared-sync')
+        .on('postgres_changes',{event:'*',schema:'public',table:'issue_projects'},scheduleSharedReload)
+        .on('postgres_changes',{event:'*',schema:'public',table:'issues'},scheduleSharedReload)
+        .subscribe();
+    }
     async function loadCalendarIssues(){
       if(!projects.length){calendarIssues=[];renderCalendar();return;}
       const result=await client.from('issues').select('id,project_id,title,priority,status,work_start_date,work_end_date,due_date').in('project_id',projects.map(function(project){return project.id;}));
@@ -143,9 +160,19 @@
       for(let offset=0;offset<42;offset++){
         const day=new Date(gridStart.getFullYear(),gridStart.getMonth(),gridStart.getDate()+offset),key=dateKey(day),muted=day.getMonth()!==month;
         const events=calendarIssues.filter(function(item){const start=item.work_start_date||item.due_date,end=item.work_end_date||item.due_date;return start&&end&&start<=key&&key<=end;});
-        html+='<div class="calendar-day '+(muted?'muted ':'')+(key===todayKey?'today':'')+'"><div class="calendar-date">'+day.getDate()+'</div>'+events.map(function(item){return '<button class="calendar-event '+(item.priority==='高'?'high ':'')+(item.status==='完了'?'done ':'')+'" title="'+esc(projectNames[item.project_id]||'')+'：'+esc(item.title)+'" data-calendar-project="'+item.project_id+'">'+esc(projectNames[item.project_id]||'')+'｜'+esc(item.title)+'</button>';}).join('')+'</div>';
+        html+='<div class="calendar-day '+(muted?'muted ':'')+(key===todayKey?'today':'')+'"><div class="calendar-date">'+day.getDate()+'</div>'+events.map(function(item){return '<button type="button" class="calendar-event '+(item.priority==='高'?'high ':'')+(item.status==='完了'?'done ':'')+'" title="'+esc(projectNames[item.project_id]||'')+'：'+esc(item.title)+'" data-calendar-issue="'+item.id+'">'+esc(projectNames[item.project_id]||'')+'｜'+esc(item.title)+'</button>';}).join('')+'</div>';
       }
-      $('calendar').innerHTML=html;$('calendar').querySelectorAll('[data-calendar-project]').forEach(function(button){button.onclick=async function(){activeProjectId=button.dataset.calendarProject;renderProjects();await loadIssues();window.scrollTo({top:0,behavior:'smooth'});};});
+      $('calendar').innerHTML=html;$('calendar').querySelectorAll('[data-calendar-issue]').forEach(function(button){button.onclick=function(){openCalendarIssue(button.dataset.calendarIssue);};});
+    }
+    async function openCalendarIssue(id){
+      const result=await client.from('issues').select('*').eq('id',id).single();
+      if(result.error){notice('詳細を読み込めませんでした：'+result.error.message,true);return;}
+      const item=result.data,beforePath=item.before_photo_path||item.photo_path||'',afterPath=item.after_photo_path||'';
+      const urls=await Promise.all([beforePath,afterPath].map(async function(path){if(!path)return '';const signed=await client.storage.from('patrol-photos').createSignedUrl(path,3600);return signed.data&&signed.data.signedUrl?signed.data.signedUrl:'';}));
+      calendarDetailIssue=Object.assign({},item,{before_photo_url:urls[0],after_photo_url:urls[1]});
+      const project=projects.find(function(p){return p.id===item.project_id;}),resources=(item.required_personnel?'必要人員：'+esc(item.required_personnel):'')+(item.required_personnel&&item.required_equipment?'　':'')+(item.required_equipment?'必要機材：'+esc(item.required_equipment):'');
+      $('calendarDetailBody').innerHTML='<p class="sub">工事名：'+esc(project?project.name:'')+'</p><h3 style="margin:8px 0">'+esc(item.title)+'</h3><p><span class="badge '+priorityClass(item.priority)+'">'+esc(item.priority)+'</span> <span class="badge '+statusClass(item.status)+'">'+esc(item.status)+'</span></p><p class="sub">発信元：'+esc(item.source||'未入力')+'<br>担当者：'+esc(item.assignee||'未入力')+'<br>対応期間：'+esc(rangeLabel(item.work_start_date||item.due_date,item.work_end_date||item.due_date))+'</p>'+(resources?'<p class="sub">'+resources+'</p>':'')+'<p style="white-space:pre-wrap">'+esc(item.memo||'メモはありません')+'</p>'+photoPairMarkup(urls[0],urls[1]);
+      $('calendarDetailDialog').showModal();
     }
     async function loadIssues(){
       if(!activeProjectId){issues=[];renderIssues();return;}
@@ -322,13 +349,19 @@
     $('beforePhoto').onchange=function(e){newBeforePhotoFile=e.target.files[0]||null;if(!newBeforePhotoFile)return;const reader=new FileReader();reader.onload=function(){$('beforePreview').innerHTML='<img class="photo-preview" src="'+reader.result+'" alt="選択した対応前写真">';};reader.readAsDataURL(newBeforePhotoFile);};
     $('afterPhoto').onchange=function(e){newAfterPhotoFile=e.target.files[0]||null;if(!newAfterPhotoFile)return;const reader=new FileReader();reader.onload=function(){$('afterPreview').innerHTML='<img class="photo-preview" src="'+reader.result+'" alt="選択した対応後写真">';};reader.readAsDataURL(newAfterPhotoFile);};
     $('closeIssue').onclick=$('cancelIssue').onclick=function(){$('issueDialog').close();};
+    $('closeCalendarDetail').onclick=$('doneCalendarDetail').onclick=function(){$('calendarDetailDialog').close();};
+    $('editCalendarIssue').onclick=async function(){if(!calendarDetailIssue)return;activeProjectId=calendarDetailIssue.project_id;$('calendarDetailDialog').close();renderProjects();await loadIssues();openIssue(issues.find(function(item){return item.id===calendarDetailIssue.id;}));};
     $('manageProjects').onclick=function(){renderProjectList();$('projectDialog').showModal();};$('closeProjects').onclick=$('doneProjects').onclick=function(){$('projectDialog').close();};$('addProject').onclick=addProject;
     ['search','statusFilter','priorityFilter','dueFilter'].forEach(function(id){$(id).oninput=renderIssues;});
     $('clearFilters').onclick=function(){$('search').value='';$('statusFilter').value='';$('priorityFilter').value='';$('dueFilter').value='';renderIssues();};
     $('calendarPrev').onclick=function(){calendarCursor=new Date(calendarCursor.getFullYear(),calendarCursor.getMonth()-1,1);renderCalendar();};
     $('calendarNext').onclick=function(){calendarCursor=new Date(calendarCursor.getFullYear(),calendarCursor.getMonth()+1,1);renderCalendar();};
+    startSharedSync();
+    document.addEventListener('visibilitychange',function(){if(!document.hidden)loadProjects();});
+    window.addEventListener('focus',loadProjects);
     loadProjects();
   })();
   </script>
 </body>
 </html>
+
